@@ -1,0 +1,500 @@
+﻿diff --git a/app/src/main/java/net/ankio/auto/adapter/AppAdapterManager.kt b/app/src/main/java/net/ankio/auto/adapter/AppAdapterManager.kt
+index 16954d1..b6b4403 100644
+--- a/app/src/main/java/net/ankio/auto/adapter/AppAdapterManager.kt
++++ b/app/src/main/java/net/ankio/auto/adapter/AppAdapterManager.kt
+@@ -51,6 +51,7 @@ object AppAdapterManager {
+             YiYuAdapter(), // 一羽记账
+             YiMuAdapter(), // 一木记账
+             XiaoXinAdapter(), // 小星记账
++            TallyAdapter(), // Tally（开源记账 App）
+         )
+     }
+ 
+diff --git a/app/src/main/java/net/ankio/auto/adapter/TallyAdapter.kt b/app/src/main/java/net/ankio/auto/adapter/TallyAdapter.kt
+new file mode 100644
+index 0000000..9ddb9d2
+--- /dev/null
++++ b/app/src/main/java/net/ankio/auto/adapter/TallyAdapter.kt
+@@ -0,0 +1,396 @@
++/*
++ * Copyright (C) 2026 ankio(ankio@ankio.net)
++ * Licensed under the Apache License, Version 3.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *         http://www.apache.org/licenses/LICENSE-3.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *   limitations under the License.
++ */
++
++package net.ankio.auto.adapter
++
++import android.content.Intent
++import android.net.Uri
++import androidx.core.net.toUri
++import com.google.gson.Gson
++import com.google.gson.JsonParser
++import net.ankio.auto.App
++import net.ankio.auto.autoApp
++import net.ankio.auto.constant.BookFeatures
++import net.ankio.auto.constant.WorkMode
++import net.ankio.auto.http.api.AssetsAPI
++import net.ankio.auto.http.api.BookNameAPI
++import net.ankio.auto.http.api.CategoryAPI
++import net.ankio.auto.storage.Logger
++import net.ankio.auto.utils.PrefManager
++import net.ankio.auto.utils.SystemUtils
++import org.ezbook.server.constant.AssetsType
++import org.ezbook.server.constant.BillAction
++import org.ezbook.server.constant.BillType
++import org.ezbook.server.constant.Currency
++import org.ezbook.server.db.model.AssetsModel
++import org.ezbook.server.db.model.BillInfoModel
++import org.ezbook.server.db.model.BookNameModel
++import org.ezbook.server.db.model.CategoryModel
++import org.ezbook.server.tools.MD5HashTable
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/**
++ * Tally（开源记账 App）适配器。
++ *
++ * 通过 Tally 提供的自动化记账协议完成记账：
++ * `tally://publicapi/addbill?type=&money=&time=&remark=&catename=&subcategory=&accountname=&accountname2=&bookname=&currency=&fee=&tag=&flag=&id=&showresult=`
++ *
++ * 对应的 Tally 侧实现见其源码 `com.example.budgetapp.api.TallyApiActivity`。
++ * 该协议由双方共同维护：Tally 侧宽容解析（未知参数忽略），因此 AA 升级不影响 Tally、Tally 升级也不影响 AA。
++ *
++ * 说明：Tally 目前把币种保存为“显示符号”，标签以 `#标签` 附加到备注中；账本字段已接收但尚未启用（多账本功能开发中）。
++ */
++class TallyAdapter : IAppAdapter {
++    override val pkg: String
++        get() = "com.example.budgetapp"
++
++    override val link: String
++        get() = "https://github.com/cypressincloud/Tally"
++
++    /** Tally 暂无公开图标地址，交由 AA 使用默认图标展示 */
++    override val icon: String
++        get() = ""
++
++    override val desc: String
++        get() = """
++Tally 是一款开源、本地优先的记账 App：支持自动记账、AI 记账、资产账户、二级分类、预算、WebDAV 云备份等，数据完全存储在本地。
++        """.trimIndent()
++
++    override val name: String
++        get() = "Tally"
++
++    /**
++     * 声明 Tally 支持的功能。
++     *
++     * 注意：AA 会按这里的声明逐项放开设置开关，并在同步前按开关裁剪账单
++     * （未声明“资产管理”时，转账会被降级为支出并清空账户名），因此这里必须与实际能力一致。
++     */
++    override fun features(): List<BookFeatures> {
++        return listOf(
++            BookFeatures.ASSET_MANAGE, // 账户/资产、转账、负债与借出
++            BookFeatures.DEBT,         // 负债(借入)/借出
++            BookFeatures.FEE,          // 手续费/优惠（并入金额并在备注标注）
++            BookFeatures.TAG,          // 标签（以 #标签 形式写入备注）
++            BookFeatures.MULTI_CURRENCY, // 币种（映射为符号保存）
++            BookFeatures.MULTI_BOOK    // 多账本（按账本名写入，账本不存在时 Tally 会自动创建）
++        )
++    }
++
++    /**
++     * 支持从 Tally 反向同步账本/账户/分类。
++     *
++     * 数据通道：Tally 暴露的**只读** ContentProvider
++     * `content://com.example.budgetapp.sync/export`（Provider 内部只允许本应用包名读取）。
++     */
++    override fun supportSyncAssets(): Boolean = true
++
++    override fun syncAssets() {
++        App.launchIO {
++            try {
++                val json = queryTallyExport()
++                if (json.isNullOrEmpty()) {
++                    Logger.e("Tally 数据同步失败：未取得数据（Tally 未安装、版本过旧或 Provider 被拒绝）")
++                    return@launchIO
++                }
++                syncBooks(json)
++                syncAssets(json)
++                syncCategories(json)
++                Logger.i("Tally 数据同步完成（账本/账户/分类）")
++            } catch (e: Exception) {
++                Logger.e("Tally 数据同步异常：${e.message}", e)
++            }
++        }
++    }
++
++    /** 读取 Tally 的只读导出数据（JSON 字符串） */
++    private fun queryTallyExport(): String? {
++        val uri = Uri.parse("content://com.example.budgetapp.sync/export")
++        val cursor = autoApp.contentResolver.query(uri, null, null, null, null) ?: return null
++        cursor.use {
++            if (it.moveToFirst()) {
++                val index = it.getColumnIndex("json")
++                if (index >= 0) {
++                    return it.getString(index)
++                }
++            }
++        }
++        return null
++    }
++
++    /** 同步账本列表 */
++    private suspend fun syncBooks(json: String) {
++        val root = JsonParser.parseString(json).asJsonObject
++        val array = root.getAsJsonArray("books") ?: return
++        val list = ArrayList<BookNameModel>()
++        array.forEach { element ->
++            val obj = element.asJsonObject
++            val model = BookNameModel()
++            model.remoteId = obj.get("id")?.asInt?.toString() ?: ""
++            model.name = obj.get("name")?.asString ?: ""
++            if (model.name.isNotEmpty()) {
++                list.add(model)
++            }
++        }
++        if (list.isEmpty()) {
++            return
++        }
++        // 逐条 upsert，避免 put 的 clear()+insert() 把 AA 已有账本清掉
++        list.forEach { book ->
++            val existing = BookNameAPI.getBook(book.name)
++            if (existing.id > 0) {
++                book.id = existing.id
++                BookNameAPI.update(book)
++            } else {
++                BookNameAPI.add(book)
++            }
++        }
++    }
++
++    /** 同步账户（资产）列表 */
++    private suspend fun syncAssets(json: String) {
++        val root = JsonParser.parseString(json).asJsonObject
++        val array = root.getAsJsonArray("assets") ?: return
++        val list = ArrayList<AssetsModel>()
++        array.forEachIndexed { index, element ->
++            val obj = element.asJsonObject
++            val name = obj.get("name")?.asString ?: ""
++            if (name.isEmpty()) {
++                return@forEachIndexed
++            }
++            val model = AssetsModel()
++            model.name = name
++            model.sort = index
++            // Tally 账户类型：0 资产、1 负债(我欠别人)、2 借出(别人欠我)、3 理财、4 分期
++            model.type = when (obj.get("type")?.asInt ?: 0) {
++                1 -> AssetsType.CREDITOR
++                2 -> AssetsType.BORROWER
++                4 -> AssetsType.CREDIT
++                else -> AssetsType.NORMAL
++            }
++            model.currency = currencyOf(obj.get("currencySymbol")?.asString)
++            list.add(model)
++        }
++        if (list.isEmpty()) {
++            return
++        }
++        // 逐条 upsert（按名称匹配已有账户），避免 put 全量替换清掉 AA 已有资产
++        list.forEach { AssetsAPI.save(it) }
++    }
++
++    /** 同步分类（一级 + 二级） */
++    private suspend fun syncCategories(json: String) {
++        val root = JsonParser.parseString(json).asJsonObject
++        val categories = root.getAsJsonObject("categories") ?: return
++        val list = ArrayList<CategoryModel>()
++
++        val expenseNames = HashSet<String>()
++        categories.getAsJsonArray("expense")?.forEachIndexed { index, element ->
++            val name = element.asString
++            if (name.isNotEmpty()) {
++                expenseNames.add(name)
++                list.add(categoryModel(name, BillType.Expend, "e:$name", "-1", index))
++            }
++        }
++        categories.getAsJsonArray("income")?.forEachIndexed { index, element ->
++            val name = element.asString
++            if (name.isNotEmpty()) {
++                list.add(categoryModel(name, BillType.Income, "i:$name", "-1", index))
++            }
++        }
++        categories.getAsJsonObject("subCategories")?.entrySet()?.forEach { (parent, value) ->
++            val type = if (expenseNames.contains(parent)) BillType.Expend else BillType.Income
++            val prefix = if (type == BillType.Expend) "e:" else "i:"
++            val parentId = "$prefix$parent"
++            var index = 0
++            value.asJsonArray.forEach { element ->
++                val child = element.asString
++                if (child.isNotEmpty()) {
++                    list.add(categoryModel(child, type, "$parentId/$child", parentId, index))
++                    index++
++                }
++            }
++        }
++        if (list.isEmpty()) {
++            return
++        }
++        // 逐条 upsert，避免 put 全量替换清掉 AA 已有分类
++        list.forEach { CategoryAPI.save(it) }
++    }
++
++    private fun categoryModel(name: String, type: BillType, remoteId: String, parentId: String, sort: Int): CategoryModel {
++        val model = CategoryModel()
++        model.name = name
++        model.type = type
++        model.remoteId = remoteId
++        model.remoteParentId = parentId
++        model.remoteBookId = ""
++        model.sort = sort
++        return model
++    }
++
++    /** Tally 的币种符号 → AA 的币种枚举（未知回退人民币） */
++    private fun currencyOf(symbol: String?): Currency {
++        val code = when (symbol) {
++            "$" -> "USD"
++            "€" -> "EUR"
++            "£" -> "GBP"
++            "JP¥" -> "JPY"
++            "₩" -> "KRW"
++            "HK$" -> "HKD"
++            "NT$" -> "TWD"
++            "S$" -> "SGD"
++            "A$" -> "AUD"
++            "C$" -> "CAD"
++            "₽" -> "RUB"
++            "฿" -> "THB"
++            "₹" -> "INR"
++            else -> "CNY"
++        }
++        return try {
++            Currency.valueOf(code)
++        } catch (e: Exception) {
++            Currency.CNY
++        }
++    }
++
++    override fun syncWaitBills(billAction: BillAction, bookName: String) {
++        // Tally 当前没有“待报销/待退款”标记，暂不处理
++    }
++
++    override fun syncBill(billInfoModel: BillInfoModel) {
++        val uriBuilder = StringBuilder("tally://publicapi/addbill")
++            .append("?type=").append(toTallyType(billInfoModel))
++            .append("&money=").append(billInfoModel.money)
++
++        // 时间（URL 编码，避免空格截断 URI）
++        if (billInfoModel.time > 0) {
++            uriBuilder.append("&time=").append(Uri.encode(formatTime(billInfoModel.time)))
++        }
++
++        // 备注（备注为空时用商户名兜底，保证账单可读）
++        val remark = billInfoModel.remark.ifEmpty { billInfoModel.shopName }
++        if (remark.isNotEmpty()) {
++            uriBuilder.append("&remark=").append(Uri.encode(remark))
++        }
++
++        // 分类（AA 用 '-' 连接父/子分类，Tally 侧自行拆分）
++        if (billInfoModel.cateName.isNotEmpty()) {
++            uriBuilder.append("&catename=").append(Uri.encode(billInfoModel.cateName))
++        }
++
++        // 账户（资产功能开启时才传递，与 AppAdapterManager 的裁剪逻辑保持一致）
++        if (PrefManager.featureAssetManage) {
++            if (billInfoModel.accountNameFrom.isNotEmpty()) {
++                uriBuilder.append("&accountname=").append(Uri.encode(billInfoModel.accountNameFrom))
++            }
++            if (billInfoModel.accountNameTo.isNotEmpty()) {
++                uriBuilder.append("&accountname2=").append(Uri.encode(billInfoModel.accountNameTo))
++            }
++        }
++
++        // 账本（多账本开启时传递；Tally 侧按名称查找，不存在则自动创建）
++        if (PrefManager.featureMultiBook
++            && billInfoModel.bookName.isNotEmpty()
++            && billInfoModel.bookName != org.ezbook.server.constant.DefaultData.DEFAULT_BOOK_NAME
++        ) {
++            uriBuilder.append("&bookname=").append(Uri.encode(billInfoModel.bookName))
++        }
++
++        // 手续费/优惠
++        if (PrefManager.featureFee && billInfoModel.fee != 0.0) {
++            uriBuilder.append("&fee=").append(billInfoModel.fee)
++        }
++
++        // 币种
++        if (PrefManager.featureMultiCurrency) {
++            uriBuilder.append("&currency=").append(billInfoModel.currencyCode())
++        } else {
++            uriBuilder.append("&currency=CNY")
++        }
++
++        // 标签
++        if (PrefManager.featureTag && billInfoModel.tags.isNotEmpty()) {
++            uriBuilder.append("&tag=").append(Uri.encode(billInfoModel.tags))
++        }
++
++        // 标志位：1 不计入统计，2 不计入预算
++        if (billInfoModel.flag != 0) {
++            uriBuilder.append("&flag=").append(billInfoModel.flag)
++        }
++
++        // 去重 ID（AA 的账单主键，Tally 侧据此保证幂等）
++        if (billInfoModel.id > 0) {
++            uriBuilder.append("&id=").append(billInfoModel.id)
++        }
++
++        if (billInfoModel.extendData.isNotEmpty()) {
++            uriBuilder.append("&extenddata=").append(Uri.encode(billInfoModel.extendData))
++        }
++
++        // 静默模式：AA 关闭“记账成功弹窗”时，让 Tally 也不要弹提示
++        // 批量同步时始终静默，避免每条账单都弹 Toast
++        uriBuilder.append("&showresult=0")
++
++        // 注意：不要使用 FLAG_ACTIVITY_CLEAR_TASK，避免清掉用户正在使用的 Tally 界面
++        // MULTIPLE_TASK + taskAffinity="" 确保在独立任务栈启动，不把 Tally 主界面拉到前台
++        val intent = Intent(Intent.ACTION_VIEW, uriBuilder.toString().toUri()).apply {
++            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
++                    Intent.FLAG_ACTIVITY_NO_ANIMATION or
++                    Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
++                    Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
++        }
++        Logger.i("目标应用uri：$uriBuilder")
++        SystemUtils.startActivityIfResolvable(intent, name) {
++            AppAdapterManager.markSynced(billInfoModel)
++        }
++    }
++
++    /**
++     * AA 账单类型 → Tally 账单类型。
++     *
++     * Tally 类型：0 支出、1 收入、2 转账、3 负债（借入）、4 借出。
++     */
++    private fun toTallyType(billInfoModel: BillInfoModel): Int {
++        return when (billInfoModel.type) {
++            BillType.Expend -> 0
++            BillType.Income -> 1
++            BillType.Transfer -> 2
++
++            // 报销/退款：Tally 无对应类型，按普通收支记账（报销类由 flag 标记为不计预算）
++            BillType.ExpendReimbursement -> 0
++            BillType.IncomeReimbursement -> 1
++            BillType.IncomeRefund -> 1
++
++            // 债务：出借记为“借出”，借入记为“负债”
++            BillType.ExpendLending -> 4
++            BillType.IncomeLending -> 3
++
++            // 还款/收款：Tally 依靠备注匹配负债/借出账户名完成抵扣
++            BillType.ExpendRepayment -> 0
++            BillType.IncomeRepayment -> 1
++        }
++    }
++
++    private fun formatTime(timeMillis: Long): String {
++        val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
++        return sdf.format(Date(timeMillis))
++    }
++
++    override fun sleep(): Long {
++        return if (WorkMode.isXposedOrLSPatch()) 500L else 3000L
++    }
++}
+diff --git a/app/src/main/java/net/ankio/auto/ui/dialog/BillEditorDialog.kt b/app/src/main/java/net/ankio/auto/ui/dialog/BillEditorDialog.kt
+index 977ebb0..0a6543a 100644
+--- a/app/src/main/java/net/ankio/auto/ui/dialog/BillEditorDialog.kt
++++ b/app/src/main/java/net/ankio/auto/ui/dialog/BillEditorDialog.kt
+@@ -196,7 +196,7 @@ class BillEditorDialog internal constructor(
+      */
+     private fun saveBill() {
+         val billInfo = billInfoModel ?: return
+-        BillTool.saveBill(billInfo)
++        BillTool.saveBill(billInfo, forceSync = true)
+         onConfirmClick?.invoke(billInfo)
+         dismiss()
+     }
+diff --git a/app/src/main/java/net/ankio/auto/ui/fragment/components/MonthlyCardComponent.kt b/app/src/main/java/net/ankio/auto/ui/fragment/components/MonthlyCardComponent.kt
+index e8e9031..657f07f 100644
+--- a/app/src/main/java/net/ankio/auto/ui/fragment/components/MonthlyCardComponent.kt
++++ b/app/src/main/java/net/ankio/auto/ui/fragment/components/MonthlyCardComponent.kt
+@@ -100,6 +100,11 @@ class MonthlyCardComponent(binding: CardMonthlyBinding) :
+                 visibility =
+                     if (PrefManager.bookApp != BuildConfig.APPLICATION_ID) View.VISIBLE else View.GONE
+                 setOnClickListener { BillTool.syncBills() }
++                setOnLongClickListener {
++                    // 长按 = 重新同步所有账单（含已同步的），用于切换记账软件后推送历史账单
++                    BillTool.resyncAllBills()
++                    true
++                }
+             }
+ 
+             btnAnalysis.setOnClickListener {
+diff --git a/app/src/main/java/net/ankio/auto/utils/BillTool.kt b/app/src/main/java/net/ankio/auto/utils/BillTool.kt
+index 3ae6c47..fabe08c 100644
+--- a/app/src/main/java/net/ankio/auto/utils/BillTool.kt
++++ b/app/src/main/java/net/ankio/auto/utils/BillTool.kt
+@@ -160,6 +160,26 @@ object BillTool {
+         return "$category1 - $category2"
+     }
+ 
++    /**
++     * 重新同步所有账单（包括已同步的）。
++     *
++     * 先把所有 Synced 状态的账单重置为待同步，再执行正常同步流程。
++     * 用于切换记账软件后把历史账单推送给新目标（如从钱迹切到 Tally）。
++     */
++    fun resyncAllBills() {
++        App.launch {
++            ToastUtils.info(R.string.sync_starting)
++            // 重置所有已同步账单为待同步
++            val syncedBills = BillAPI.exportList(BillState.Synced, 0, Long.MAX_VALUE).getOrDefault(emptyList())
++            syncedBills.forEach { BillAPI.status(it.id, false) }
++            if (syncedBills.isNotEmpty()) {
++                Logger.i("已重置 ${syncedBills.size} 条已同步账单为待同步")
++            }
++            // 执行正常同步
++            syncBills()
++        }
++    }
++
+     fun syncBills() {
+         App.launch {
+             // 开始同步提示
+@@ -221,7 +241,7 @@ object BillTool {
+         delay(AppAdapterManager.adapter().sleep())
+     }
+ 
+-    fun saveBill(bill: BillInfoModel, onComplete: (() -> Unit)? = null) {
++    fun saveBill(bill: BillInfoModel, forceSync: Boolean = false, onComplete: (() -> Unit)? = null) {
+         Logger.d("保存账单: ${bill.id}")
+ 
+         // 更新状态
+@@ -231,11 +251,12 @@ object BillTool {
+         App.launchIO {
+             try {
+                 BillAPI.put(bill)
+-                // 若未开启手动同步，则根据延迟同步阈值决定同步策略
+-                if (!PrefManager.manualSync && !bill.isChild()) {
++                // forceSync 为 true 时忽略手动同步开关，直接同步
++                // 否则根据手动同步开关和延迟同步阈值决定同步策略
++                if ((forceSync || !PrefManager.manualSync) && !bill.isChild()) {
+                     val threshold = PrefManager.delayedSyncThreshold
+-                    if (threshold == 0) {
+-                        // 阈值为0表示实时同步，立即同步当前账单
++                    if (threshold == 0 || forceSync) {
++                        // 阈值为0表示实时同步（或强制同步），立即同步当前账单
+                         syncBill(bill)
+                     } else {
+                         // 阈值大于0，检查未同步账单数量
